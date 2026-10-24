@@ -26,6 +26,7 @@ type Stats struct {
 	Pending   int // never leased, or failed and waiting
 	Leased    int // currently held by a worker (may have expired)
 	Completed int // acked successfully
+	Dead      int // dead-letter / needs intervention
 }
 
 var (
@@ -65,6 +66,7 @@ type job struct {
 type JobQueue struct {
 	clock Clock
 	cfg   Config
+	store *fileStore // nil = memory-only (harness New)
 
 	mu      sync.Mutex
 	nextID  uint64
@@ -75,20 +77,88 @@ type JobQueue struct {
 	rng     *rand.Rand
 }
 
-// New constructs an empty queue with production DefaultConfig.
+// New constructs an empty in-memory queue with production DefaultConfig.
 func New(clock Clock) *JobQueue {
 	return NewWithConfig(clock, DefaultConfig())
 }
 
-// NewWithConfig constructs a queue with explicit knobs (useful in unit tests).
+// NewWithConfig constructs an in-memory queue with explicit knobs.
 func NewWithConfig(clock Clock, cfg Config) *JobQueue {
 	cfg = cfg.normalized()
 	return &JobQueue{
-		clock:  clock,
-		cfg:    cfg,
-		jobs:   make(map[string]*job),
-		rng:    rand.New(rand.NewSource(1)),
+		clock: clock,
+		cfg:   cfg,
+		jobs:  make(map[string]*job),
+		rng:   rand.New(rand.NewSource(1)),
 	}
+}
+
+// NewPersistent opens (or creates) a store under dir.
+// Unfinished jobs (jobs/) load as pending; dead/ loads into the dead-letter list.
+// Leases are not restored.
+func NewPersistent(clock Clock, dir string, cfg Config) (*JobQueue, error) {
+	cfg = cfg.normalized()
+	store, err := newFileStore(dir)
+	if err != nil {
+		return nil, err
+	}
+	q := &JobQueue{
+		clock: clock,
+		cfg:   cfg,
+		store: store,
+		jobs:  make(map[string]*job),
+		rng:   rand.New(rand.NewSource(1)),
+	}
+	if err := q.loadFromStore(); err != nil {
+		return nil, err
+	}
+	return q, nil
+}
+
+func (q *JobQueue) loadFromStore() error {
+	live, err := q.store.loadJobs()
+	if err != nil {
+		return err
+	}
+	deadRecs, err := q.store.loadDead()
+	if err != nil {
+		return err
+	}
+	now := q.clock.Now()
+	q.nextID = maxNumericID(live, deadRecs)
+
+	for _, rec := range live {
+		payload := append([]byte(nil), rec.Payload...)
+		j := &job{
+			id:           rec.ID,
+			payload:      payload,
+			status:       statusPending,
+			priority:     rec.Priority,
+			attempts:     rec.Attempts,
+			waitingSince: now,
+		}
+		q.jobs[j.id] = j
+		q.pending = append(q.pending, j.id)
+	}
+	for _, rec := range deadRecs {
+		payload := append([]byte(nil), rec.Payload...)
+		j := &job{
+			id:       rec.ID,
+			payload:  payload,
+			status:   statusDead,
+			priority: rec.Priority,
+			attempts: rec.Attempts,
+		}
+		q.jobs[j.id] = j
+		q.dead = append(q.dead, DeadJob{
+			ID:       rec.ID,
+			Payload:  payload,
+			Attempts: rec.Attempts,
+			Reason:   rec.Reason,
+		})
+	}
+	q.metrics.DeadLetterCount = len(q.dead)
+	return nil
 }
 
 // Enqueue stores a new job at default priority 0 and returns its unique ID.
@@ -124,17 +194,30 @@ func (q *JobQueue) enqueueLocked(payload []byte, priority int) (string, error) {
 	q.jobs[id] = j
 	q.pending = append(q.pending, id)
 	q.metrics.Enqueued++
+	if q.store != nil {
+		if err := q.store.save(j); err != nil {
+			delete(q.jobs, id)
+			q.pending = q.pending[:len(q.pending)-1]
+			q.metrics.Enqueued--
+			return "", err
+		}
+	}
 	return id, nil
 }
 
 // Lease atomically reserves the next available job for workerID.
-// Returns (nil, nil) when no job is available.
+// Returns (nil, nil) when no job is available (or worker is at in-flight cap).
 func (q *JobQueue) Lease(workerID string, leaseMS int64) (*LeasedJob, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	now := q.clock.Now()
 	q.reclaimExpired(now)
+
+	if q.countInFlight(workerID, now) >= q.cfg.MaxInFlightPerWorker {
+		q.metrics.LeaseSkippedInFlightCap++
+		return nil, nil
+	}
 
 	idx := q.findAvailablePending(now)
 	if idx < 0 {
@@ -153,6 +236,11 @@ func (q *JobQueue) Lease(workerID string, leaseMS int64) (*LeasedJob, error) {
 	q.metrics.Leased++
 	if j.attempts > q.metrics.MaxAttemptsObserved {
 		q.metrics.MaxAttemptsObserved = j.attempts
+	}
+	if q.store != nil {
+		if err := q.store.save(j); err != nil {
+			return nil, err
+		}
 	}
 
 	payload := make([]byte, len(j.payload))
@@ -179,6 +267,11 @@ func (q *JobQueue) Ack(workerID, jobID string) error {
 	j.holder = ""
 	j.leaseExpiresAt = 0
 	q.metrics.Acked++
+	if q.store != nil {
+		if err := q.store.delete(jobID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -209,8 +302,8 @@ func (q *JobQueue) Fail(workerID, jobID string) error {
 	return nil
 }
 
-// Stats returns counts of jobs by state. Dead-letter jobs are excluded from
-// Pending/Leased/Completed (they are terminal for the drain loop).
+// Stats returns counts of jobs by state. Dead-letter jobs are counted in Dead
+// only (not Pending/Leased/Completed) so the harness drain loop still exits.
 func (q *JobQueue) Stats() Stats {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -224,6 +317,8 @@ func (q *JobQueue) Stats() Stats {
 			s.Leased++
 		case statusCompleted:
 			s.Completed++
+		case statusDead:
+			s.Dead++
 		}
 	}
 	return s
@@ -337,6 +432,19 @@ func (q *JobQueue) moveToDead(j *job, reason string) {
 		Reason:   reason,
 	})
 	q.metrics.DeadLetterCount = len(q.dead)
+	if q.store != nil {
+		_ = q.store.saveDead(j, reason)
+	}
+}
+
+func (q *JobQueue) countInFlight(workerID string, now int64) int {
+	n := 0
+	for _, j := range q.jobs {
+		if j.status == statusLeased && j.holder == workerID && now < j.leaseExpiresAt {
+			n++
+		}
+	}
+	return n
 }
 
 func (q *JobQueue) findAvailablePending(now int64) int {

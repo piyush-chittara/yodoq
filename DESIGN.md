@@ -40,47 +40,74 @@ effective = priority + (now - waitingSince) / PriorityAgeBoostEveryMS
 
 Without aging, a steady stream of high-priority work would starve low-priority jobs. Aging is the anti-starvation policy: wait long enough and a low base priority can outrank a fresh higher one.
 
+## Fairness
+
+**Jobs:** FIFO among equal effective priority, aging so low priority is not starved, `MaxAttempts` so one poison job cannot retry forever, expiry backoff so reclaim storms are spaced.
+
+**Workers:** `MaxInFlightPerWorker` (default 8) caps how many unexpired leases one `workerID` may hold. Further `Lease` calls return `(nil, nil)` until some complete (`LeaseSkippedInFlightCap` metric). A greedy worker cannot vacuum every pending job while others get nothing. The harness ticks one lease per worker per round, so default 8 does not affect graded Levels 1–3.
+
 ## Retry and dead letter
 
 Defaults live in `DefaultConfig()` and are what `New(clock)` uses. `NewWithConfig` exists so tests can set a low attempt ceiling without forking behavior.
 
 | Knob | Default | Rationale |
 |------|---------|-----------|
-| `MaxAttempts` | 32 | Cap poison messages. After this many leases without an `Ack`, the job goes to the dead-letter list instead of spinning forever. 32 is high enough that under the harness’s ≤50% crash rate and 200 jobs, DLQ is effectively unused, but the path is real and covered by unit tests. |
-| Expiry backoff | base 50ms, ×2, cap 2000ms, ±20% jitter | After an expired lease is reclaimed, `availableAt = expiredAt + backoff(attempts)`. Anchoring at **expiry time** (not reclaim time) keeps “advance clock, then `Lease`” correct. |
-| `Fail` backoff | none | Required by the assignment: immediately re-leasable. |
-| `PriorityAgeBoostEveryMS` | 1000 | Aging step for effective priority; 0 disables. |
+| `MaxAttempts` | 32 | Cap poison messages. After this many leases without an `Ack`, the job goes to the dead-letter list instead of spinning forever. |
+| Expiry backoff | base 50ms, ×2, cap 2000ms, ±20% jitter | `availableAt = expiredAt + backoff(attempts)`. Anchored at expiry time. |
+| `Fail` backoff | none | Immediately re-leasable per API. |
+| `PriorityAgeBoostEveryMS` | 1000 | Aging step; 0 disables. |
+| `MaxInFlightPerWorker` | 8 | Concurrent lease cap per worker. |
 
-Dead-letter jobs are excluded from `Stats` pending/leased/completed so a drain loop that only watches those counters can finish. Inspect them with `DeadLetter()` / `Metrics()`.
+Dead-letter jobs are counted in `Stats.Dead` only (not Pending/Leased/Completed), so the harness drain loop that watches Pending/Leased still exits. Inspect details with `DeadLetter()` / `Metrics()`.
+
+## Persistence (minimum on-disk footprint)
+
+Minimum footprint is unfinished work plus dead letters — not an append-only history of every lease/ack.
+
+| Event | Disk |
+|-------|------|
+| Enqueue | Write `jobs/<id>.json` (id, payload, priority, attempts) |
+| Lease / Fail / expiry | No durable ownership. Attempts are rewritten on lease so `MaxAttempts` survives restart. Holder/expiry are not stored. |
+| Ack | **Delete** `jobs/<id>.json` — completed work leaves nothing on disk |
+| Dead letter | Write `dead/<id>.json` (includes reason), remove from `jobs/` — survives restart for intervention, not reloaded as pending |
+
+On restart (`NewPersistent`):
+
+- `jobs/` → pending/available (leases are not restored)
+- `dead/` → dead-letter list + `Stats.Dead`
+
+A WAL of every lease/ack would grow without bound. Live + dead sets stay proportional to open and poisoned work.
+
+- `New(clock)` / `NewWithConfig` — memory only (what the harness uses).
+- `NewPersistent(clock, dir, cfg)` — store under `dir/jobs/` and `dir/dead/`.
 
 ## Observability
 
-- `Stats()` — sizes the harness already understands.
-- `Metrics()` — counters useful when debugging: expired reclaim, stale ack/fail, dead-letter count, max attempts seen.
+- `Stats()` — Pending, Leased, Completed, **Dead**.
+- `Metrics()` — expired reclaim, stale ack/fail, dead-letter count, max attempts seen, in-flight cap skips.
 - `DeadLetter()` — id, payload copy, attempt count, reason string.
 
 ## Assumptions
 
-1. Single process, memory only. Restart loses queue state.
-2. Workers pick their own `leaseMS`. The queue does not extend leases; long work must use a lease long enough to finish (or fail and retry).
-3. Job ids are opaque monotonic strings. The graded harness only calls `Enqueue` (priority 0), so Levels 1–3 still behave as FIFO among equal priority.
-4. “Lost work” means a job never successfully executed. The queue’s job is to keep leasing until `Ack` or dead-letter; the harness ledger is the ground truth for executions.
+1. Default `New` is memory-only. Persistent mode survives process restart via the live-set files above.
+2. Workers pick their own `leaseMS`. The queue does not extend leases.
+3. Job ids are opaque monotonic strings. The graded harness only calls `Enqueue` (priority 0).
+4. “Lost work” means a job never successfully executed. The harness ledger is ground truth for executions.
 
 ## Not built (and why)
 
 | Idea | Why not |
 |------|---------|
-| Idempotency keys on enqueue | Solves producer double-submit. Does not stop re-lease after ack-drop. Handlers should be idempotent instead. |
-| Persistence / WAL | Out of scope for the take-home. A minimal design would log enqueue/lease/ack/fail/dead and rebuild maps on boot. |
-| `ExtendLease` / heartbeat | Not in the provided API. Needed only when work regularly outlives a fixed lease. |
-| Payload size limits, rate limits, multi-tenant fair share | Operational hardening; no signal in the assignment. |
+| Idempotency keys on enqueue | Solves producer double-submit, not ack-drop re-delivery. Handlers should be idempotent. |
+| `ExtendLease` / heartbeat | Not in the provided API. |
 
 ## Layout
 
 ```
-solution/queue.go    # state machine + API
-solution/config.go   # Config / defaults
-solution/metrics.go  # Metrics, DeadJob
+solution/queue.go       # state machine + API
+solution/config.go      # Config / defaults
+solution/metrics.go     # Metrics, DeadJob
+solution/store.go       # live-set file store for NewPersistent
 solution/queue_test.go
 ```
 

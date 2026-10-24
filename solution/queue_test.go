@@ -2,6 +2,8 @@ package solution
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 )
@@ -121,7 +123,7 @@ func TestMaxAttemptsDeadLetter(t *testing.T) {
 		t.Fatalf("DeadLetter = %+v", dl)
 	}
 	s := q.Stats()
-	if s.Pending != 0 || s.Leased != 0 {
+	if s.Pending != 0 || s.Leased != 0 || s.Dead != 1 {
 		t.Fatalf("Stats after DLQ = %+v", s)
 	}
 }
@@ -142,6 +144,9 @@ func TestFailDeadLetterAtMaxAttempts(t *testing.T) {
 	}
 	if len(q.DeadLetter()) != 1 {
 		t.Fatalf("want 1 dead job")
+	}
+	if q.Stats().Dead != 1 {
+		t.Fatalf("Stats.Dead = %d", q.Stats().Dead)
 	}
 }
 
@@ -304,5 +309,177 @@ func TestPriorityAging(t *testing.T) {
 	j, err := q.Lease("w1", 1000)
 	if err != nil || j == nil || j.ID != low {
 		t.Fatalf("aged low should beat fresh high=2, got %+v (low=%s high=%s)", j, low, high)
+	}
+}
+
+func TestMaxInFlightPerWorker(t *testing.T) {
+	clock := &fakeClock{}
+	q := NewWithConfig(clock, Config{
+		MaxAttempts:          32,
+		MaxInFlightPerWorker: 1,
+		BackoffBaseMS:        0,
+	})
+
+	_, _ = q.Enqueue([]byte("a"))
+	_, _ = q.Enqueue([]byte("b"))
+	_, _ = q.Enqueue([]byte("c"))
+
+	j1, err := q.Lease("w1", 5000)
+	if err != nil || j1 == nil {
+		t.Fatalf("first lease: %v %v", j1, err)
+	}
+	j2, err := q.Lease("w1", 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j2 != nil {
+		t.Fatalf("worker at in-flight cap should get nil, got %+v", j2)
+	}
+	if q.Metrics().LeaseSkippedInFlightCap < 1 {
+		t.Fatal("expected LeaseSkippedInFlightCap")
+	}
+
+	jOther, err := q.Lease("w2", 5000)
+	if err != nil || jOther == nil {
+		t.Fatalf("other worker should lease, got %v err=%v", jOther, err)
+	}
+
+	_ = q.Ack("w1", j1.ID)
+	j3, err := q.Lease("w1", 5000)
+	if err != nil || j3 == nil {
+		t.Fatalf("after ack, w1 should lease again, got %v err=%v", j3, err)
+	}
+	_ = q.Ack("w2", jOther.ID)
+	_ = q.Ack("w1", j3.ID)
+}
+
+func TestPersistentEnqueueAckRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	clock := &fakeClock{}
+
+	q1, err := NewPersistent(clock, dir, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := q1.Enqueue([]byte("persist-me"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "jobs", id+".json")); err != nil {
+		t.Fatalf("expected job file: %v", err)
+	}
+
+	q2, err := NewPersistent(clock, dir, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := q2.Lease("w1", 1000)
+	if err != nil || j == nil || j.ID != id || string(j.Payload) != "persist-me" {
+		t.Fatalf("reloaded lease: %+v err=%v", j, err)
+	}
+	if err := q2.Ack("w1", id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "jobs", id+".json")); !os.IsNotExist(err) {
+		t.Fatalf("ack should delete file, err=%v", err)
+	}
+
+	q3, err := NewPersistent(clock, dir, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j, _ := q3.Lease("w1", 1000); j != nil {
+		t.Fatalf("acked job should be gone after reopen, got %+v", j)
+	}
+}
+
+func TestPersistentLeaseWithoutAckSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	clock := &fakeClock{}
+
+	q1, err := NewPersistent(clock, dir, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := q1.Enqueue([]byte("leased"))
+	j, _ := q1.Lease("w1", 1000)
+	if j == nil || j.ID != id {
+		t.Fatal("lease failed")
+	}
+	// No ack — simulate crash by opening a new queue on the same dir.
+	q2, err := NewPersistent(&fakeClock{}, dir, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	j2, err := q2.Lease("w2", 1000)
+	if err != nil || j2 == nil || j2.ID != id {
+		t.Fatalf("unacked job should be pending after restart, got %+v err=%v", j2, err)
+	}
+}
+
+func TestPersistentAttemptsSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	clock := &fakeClock{}
+	cfg := Config{MaxAttempts: 3, BackoffBaseMS: 0, MaxInFlightPerWorker: 8}
+
+	q1, err := NewPersistent(clock, dir, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := q1.Enqueue([]byte("x"))
+	j, _ := q1.Lease("w1", 100)
+	_ = j
+	clock.advance(200) // expire without ack
+
+	q2, err := NewPersistent(&fakeClock{}, dir, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// attempts was 1 and persisted; two more leases then DLQ on third expiry path
+	if j, _ := q2.Lease("w1", 100); j == nil || j.ID != id {
+		t.Fatal("expected lease attempt 2")
+	}
+}
+
+func TestPersistentDeadLetterSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	clock := &fakeClock{}
+	cfg := Config{MaxAttempts: 1, BackoffBaseMS: 0, MaxInFlightPerWorker: 8}
+
+	q1, err := NewPersistent(clock, dir, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := q1.Enqueue([]byte("poison"))
+	j, _ := q1.Lease("w1", 1000)
+	if j == nil {
+		t.Fatal("lease")
+	}
+	if err := q1.Fail("w1", id); err != nil {
+		t.Fatal(err)
+	}
+	if q1.Stats().Dead != 1 {
+		t.Fatalf("Stats.Dead = %d", q1.Stats().Dead)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dead", id+".json")); err != nil {
+		t.Fatalf("expected dead file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "jobs", id+".json")); !os.IsNotExist(err) {
+		t.Fatal("job file should be removed from jobs/")
+	}
+
+	q2, err := NewPersistent(&fakeClock{}, dir, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q2.Stats().Dead != 1 || q2.Stats().Pending != 0 {
+		t.Fatalf("after reopen Stats = %+v", q2.Stats())
+	}
+	dl := q2.DeadLetter()
+	if len(dl) != 1 || dl[0].ID != id {
+		t.Fatalf("DeadLetter = %+v", dl)
+	}
+	if j, _ := q2.Lease("w1", 1000); j != nil {
+		t.Fatalf("dead job must not lease, got %+v", j)
 	}
 }

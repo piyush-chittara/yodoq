@@ -27,6 +27,11 @@ type Config struct {
 	// interval a job has spent waiting in pending since waitingSince.
 	// Zero disables aging (base priority only).
 	PriorityAgeBoostEveryMS int64
+
+	// MaxInFlightPerWorker caps how many unexpired leases one workerID may
+	// hold. Further Lease calls return (nil, nil) until some complete.
+	// Zero is normalized to the default.
+	MaxInFlightPerWorker int
 }
 
 // DefaultConfig returns production defaults safe for the YODOQ harness
@@ -39,6 +44,7 @@ func DefaultConfig() Config {
 		BackoffCapMS:            2000,
 		BackoffJitterFraction:   0.2,
 		PriorityAgeBoostEveryMS: 1000,
+		MaxInFlightPerWorker:    8,
 	}
 }
 
@@ -61,6 +67,9 @@ func (c Config) normalized() Config {
 	}
 	if c.PriorityAgeBoostEveryMS < 0 {
 		c.PriorityAgeBoostEveryMS = d.PriorityAgeBoostEveryMS
+	}
+	if c.MaxInFlightPerWorker <= 0 {
+		c.MaxInFlightPerWorker = d.MaxInFlightPerWorker
 	}
 	return c
 }
